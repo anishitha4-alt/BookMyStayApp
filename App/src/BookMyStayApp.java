@@ -43,15 +43,19 @@ class InventoryService {
         return inventory.getOrDefault(roomType, 0);
     }
 
-    // VALIDATION added
     public void decreaseRoom(String roomType) throws InvalidBookingException {
         int current = inventory.getOrDefault(roomType, -1);
 
         if (current <= 0) {
-            throw new InvalidBookingException("Cannot allocate room. No availability for " + roomType);
+            throw new InvalidBookingException("No availability for " + roomType);
         }
 
         inventory.put(roomType, current - 1);
+    }
+
+    // ⭐ NEW: rollback support
+    public void increaseRoom(String roomType) {
+        inventory.put(roomType, inventory.getOrDefault(roomType, 0) + 1);
     }
 
     public boolean isValidRoomType(String roomType) {
@@ -76,12 +80,16 @@ class BookingHistory {
         history.add(r);
     }
 
+    public boolean remove(String guestName) {
+        return history.removeIf(r -> r.getGuestName().equals(guestName));
+    }
+
     public List<Reservation> getAll() {
         return history;
     }
 }
 
-// -------------------- UPDATED BOOKING SERVICE --------------------
+// -------------------- BOOKING SERVICE --------------------
 
 class BookingService {
 
@@ -89,7 +97,10 @@ class BookingService {
     private InventoryService inventory;
     private BookingHistory history;
 
-    private HashMap<String, Set<String>> allocatedRooms = new HashMap<>();
+    private HashMap<String, String> guestRoomMap = new HashMap<>(); // guest -> roomId
+    private HashMap<String, String> guestRoomType = new HashMap<>(); // guest -> type
+
+    private Stack<String> rollbackStack = new Stack<>(); // ⭐ LIFO
 
     public BookingService(Queue<Reservation> requestQueue,
                           InventoryService inventory,
@@ -104,71 +115,71 @@ class BookingService {
         while (!requestQueue.isEmpty()) {
 
             Reservation request = requestQueue.poll();
+            String guest = request.getGuestName();
             String roomType = request.getRoomType();
 
-            System.out.println("\nProcessing request for " + request.getGuestName());
+            System.out.println("\nProcessing request for " + guest);
 
             try {
 
-                // ✅ VALIDATION: room type check
                 if (!inventory.isValidRoomType(roomType)) {
-                    throw new InvalidBookingException("Invalid Room Type: " + roomType);
+                    throw new InvalidBookingException("Invalid Room Type");
                 }
 
-                // ✅ VALIDATION: availability check
                 if (inventory.getAvailability(roomType) <= 0) {
-                    throw new InvalidBookingException("No rooms available for " + roomType);
+                    throw new InvalidBookingException("No rooms available");
                 }
 
                 String roomId = roomType.replace(" ", "") + "-"
                         + UUID.randomUUID().toString().substring(0, 5);
 
-                allocatedRooms.putIfAbsent(roomType, new HashSet<>());
-                allocatedRooms.get(roomType).add(roomId);
-
-                // may throw exception
                 inventory.decreaseRoom(roomType);
 
                 history.add(request);
 
-                System.out.println("Reservation Confirmed for " + request.getGuestName());
-                System.out.println("Allocated Room ID: " + roomId);
+                // ⭐ track allocation
+                guestRoomMap.put(guest, roomId);
+                guestRoomType.put(guest, roomType);
+                rollbackStack.push(roomId);
+
+                System.out.println("Reservation Confirmed for " + guest);
+                System.out.println("Room ID: " + roomId);
 
             } catch (InvalidBookingException e) {
-
-                // ✅ GRACEFUL ERROR HANDLING
-                System.out.println("Reservation Failed for " + request.getGuestName());
+                System.out.println("Reservation Failed for " + guest);
                 System.out.println("Reason: " + e.getMessage());
             }
         }
     }
 
-    public void displayAllocations() {
+    // ⭐ NEW: Cancellation
+    public void cancelBooking(String guestName) {
 
-        System.out.println("\nAllocated Rooms:");
+        System.out.println("\nCancellation request for " + guestName);
 
-        for (String type : allocatedRooms.keySet()) {
-            System.out.println(type + " -> " + allocatedRooms.get(type));
+        if (!guestRoomMap.containsKey(guestName)) {
+            System.out.println("Cancellation Failed: No such booking found");
+            return;
         }
-    }
-}
 
-// -------------------- REPORT SERVICE --------------------
+        String roomId = guestRoomMap.get(guestName);
+        String roomType = guestRoomType.get(guestName);
 
-class BookingReportService {
-
-    private BookingHistory history;
-
-    public BookingReportService(BookingHistory history) {
-        this.history = history;
-    }
-
-    public void showAllBookings() {
-        System.out.println("\nBooking History:");
-
-        for (Reservation r : history.getAll()) {
-            System.out.println(r.getGuestName() + " -> " + r.getRoomType());
+        // LIFO rollback
+        if (!rollbackStack.isEmpty() && rollbackStack.peek().equals(roomId)) {
+            rollbackStack.pop();
         }
+
+        // restore inventory
+        inventory.increaseRoom(roomType);
+
+        // remove from records
+        guestRoomMap.remove(guestName);
+        guestRoomType.remove(guestName);
+        history.remove(guestName);
+
+        System.out.println("Booking cancelled for " + guestName);
+        System.out.println("Released Room ID: " + roomId);
     }
 }
 
@@ -179,17 +190,15 @@ public class BookMyStayApp {
     public static void main(String[] args) {
 
         System.out.println("=====================================");
-        System.out.println("       Book My Stay v9.0");
-        System.out.println("   Error Handling & Validation");
+        System.out.println("       Book My Stay v10.0");
+        System.out.println("   Cancellation & Rollback");
         System.out.println("=====================================");
 
         Queue<Reservation> requestQueue = new LinkedList<>();
 
         requestQueue.add(new Reservation("Alice", "Single Room"));
         requestQueue.add(new Reservation("Bob", "Double Room"));
-        requestQueue.add(new Reservation("Charlie", "Invalid Room")); // ❌ invalid
-        requestQueue.add(new Reservation("David", "Suite Room"));
-        requestQueue.add(new Reservation("Eva", "Suite Room")); // ❌ no availability
+        requestQueue.add(new Reservation("Charlie", "Single Room"));
 
         InventoryService inventory = new InventoryService();
         BookingHistory history = new BookingHistory();
@@ -198,10 +207,13 @@ public class BookMyStayApp {
                 new BookingService(requestQueue, inventory, history);
 
         bookingService.processBookings();
-        bookingService.displayAllocations();
+
         inventory.displayInventory();
 
-        BookingReportService report = new BookingReportService(history);
-        report.showAllBookings();
+        // ⭐ CANCEL BOOKINGS
+        bookingService.cancelBooking("Charlie");
+        bookingService.cancelBooking("Unknown"); // invalid
+
+        inventory.displayInventory();
     }
 }
